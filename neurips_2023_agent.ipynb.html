@@ -1,0 +1,522 @@
+<html>
+<head>
+<title>neurips_2023_agent.ipynb</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080; font-style: italic;}
+.s1 { color: #000000;}
+.s2 { color: #000080; font-weight: bold;}
+.s3 { color: #008000; font-weight: bold;}
+.s4 { color: #0000ff;}
+</style>
+</head>
+<body bgcolor="#ffffff">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#c0c0c0" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+neurips_2023_agent.ipynb</font>
+</center></td></tr></table>
+<pre><span class="s0">#%% md 
+</span># NeurIPS 2023问答agent（未完成） 
++ 主要特点 
+    + 跨领域、文档的全面分析 
+    + 相关内容的理解和定位 
++ 例子： 
+    &gt; “基于GNN的多跳推理在这次会议上有新的进展吗？” 
+    &gt; “因果推理用于改善决策的问题有什么新思路吗？” 
+ 
+说明：     
++ 需要安装redis 
++ 用了clash进行本地代理 
+<span class="s0">#%% md 
+</span># 数据采集 
+<span class="s0">#%% 
+# NeurIPS 2023的论文标题列表</span>
+<span class="s2">import </span>re, requests, aiohttp, asyncio, os, pickle, json, time, redis, re, random, hashlib
+<span class="s2">from </span>fn <span class="s2">import </span>F
+<span class="s2">from </span>returns.future <span class="s2">import </span>Future
+<span class="s2">from </span>tqdm.asyncio <span class="s2">import </span>tqdm
+<span class="s2">from </span>bs4 <span class="s2">import </span>BeautifulSoup
+os.environ[<span class="s3">'http_proxy'</span>] = <span class="s3">&quot;http://127.0.0.1:7890&quot;</span>
+os.environ[<span class="s3">'https_proxy'</span>] = <span class="s3">&quot;http://127.0.0.1:7890&quot;</span>
+
+neurips_url = <span class="s3">'https://neurips.cc/virtual/2023/papers.html?filter=titles'</span>
+titles = re.findall(<span class="s3">r'&lt;a href=&quot;[^&quot;]*&quot;&gt;(.+?)&lt;/a&gt;'</span>, requests.get(neurips_url).text)
+<span class="s0">#%% md 
+</span>## 并发API获取和存储 
+<span class="s0">#%% 
+</span><span class="s2">import </span>httpx
+
+redis_client = redis.Redis(db=<span class="s4">15</span>)
+
+
+<span class="s0"># 一个通用异步网络请求框架</span>
+<span class="s0"># fetch逻辑是把data参数传给invoker然后获取response。invoker可以是任意的请求调用函数</span>
+
+
+<span class="s2">def </span>build_fetcher(invoker):
+    ...
+    <span class="s2">async def </span>fetch(**args):
+        <span class="s0"># async with semaphore:</span>
+        <span class="s2">assert </span><span class="s3">'semaphore' </span><span class="s2">in </span>args.keys()
+        <span class="s2">async with </span>args[<span class="s3">'semaphore'</span>]:
+            <span class="s2">try</span>:
+                <span class="s2">async with await </span>invoker(**args) <span class="s2">as </span>response: <span class="s0">#coroutine</span>
+                    <span class="s2">if </span>response.status == <span class="s4">200</span>:
+                        res = <span class="s2">await </span>response.text()
+                        <span class="s2">assert </span><span class="s3">'data' </span><span class="s2">in </span>args.keys()
+                        <span class="s2">return </span>{<span class="s3">'input'</span>:args[<span class="s3">'data'</span>], <span class="s3">'response'</span>:res}
+                    <span class="s2">else</span>:
+                        error_message = <span class="s2">await </span>response.text()
+                        print(<span class="s3">f&quot;Request failed: </span><span class="s2">{</span>response.status<span class="s2">}</span><span class="s3">. Error message: </span><span class="s2">{</span>error_message<span class="s2">}</span><span class="s3">&quot;</span>)
+            <span class="s2">except </span>Exception <span class="s2">as </span>e:
+                print(<span class="s3">f&quot;error: </span><span class="s2">{</span>e<span class="s2">}</span><span class="s3">&quot;</span>)
+    fetch.url = invoker.url
+    <span class="s2">return </span>fetch
+
+<span class="s0"># 并发调用fetch&amp;然后缓存到redis的一种实现方式。基于输入的data用key模板函数分配唯一的key。</span>
+<span class="s0"># data → fetch → (key, result) → redis</span>
+<span class="s0"># 会给invoker的每个协程分配session和同步信号量</span>
+
+<span class="s2">def </span>fetch_spawn_concurrent(fetcher, key_template, workers=<span class="s4">10</span>):
+    <span class="s2">async def </span>_fetch_spawn_concurrent(inputs):
+        
+        key_set = set(map(key_template, inputs))
+        print(<span class="s3">'total:'</span>, len(key_set))
+        print(<span class="s3">'to fetch: '</span>, len(set(filter(<span class="s2">lambda </span>x:<span class="s2">not </span>redis_client.exists(x), key_set))))
+        
+        semaphore = asyncio.Semaphore(workers)
+        <span class="s2">async with </span>aiohttp.ClientSession() <span class="s2">as </span>session:
+        <span class="s0"># async with httpx.AsyncClient(timeout=5,</span>
+        <span class="s0">#                              proxies={&quot;http://&quot;: &quot;http://127.0.0.1:7890&quot;, </span>
+        <span class="s0">#                                       &quot;https://&quot;: &quot;http://127.0.0.1:7890&quot;}</span>
+        <span class="s0">#                              ) as invoker_client:</span>
+            tasks = [fetcher(data=input, 
+                             semaphore=semaphore, 
+                             session=session) <span class="s2">for </span>input <span class="s2">in </span>inputs 
+                     <span class="s2">if not </span>redis_client.exists(key_template(input))]
+            <span class="s2">for </span>f <span class="s2">in </span>tqdm.as_completed(tasks, total=len(tasks), desc=<span class="s3">f'[Fetching] </span><span class="s2">{</span>fetcher.url<span class="s2">}</span><span class="s3">'</span>):
+                result = <span class="s2">await </span>f
+                match result:
+                    case {<span class="s3">'input'</span>:input, <span class="s3">'response'</span>:_}:
+                        redis_client.set(key_template(input), json.dumps(result))
+    <span class="s2">return </span>_fetch_spawn_concurrent
+
+<span class="s0"># 用于元数据的redis key模板函数</span>
+<span class="s0"># data → key</span>
+<span class="s2">def </span>key_template_metadata(source, conf):
+    <span class="s2">def </span>_key_template(data):
+        _data = re.sub(<span class="s3">'[^\w\-_\s]'</span>, <span class="s3">''</span>, re.sub(<span class="s3">':'</span>, <span class="s3">'-'</span>, data))
+        <span class="s2">return </span><span class="s3">f&quot;</span><span class="s2">{</span>source<span class="s2">}</span><span class="s3">:</span><span class="s2">{</span>conf<span class="s2">}</span><span class="s3">:</span><span class="s2">{</span>_data<span class="s2">}</span><span class="s3">&quot;</span>
+    <span class="s2">return </span>_key_template
+
+<span class="s0"># 定义了采集不同数据的redis key模板函数</span>
+key_template_neurips_abs = key_template_metadata(<span class="s3">'neurips:abs'</span>, <span class="s3">'NeurIPS-2023'</span>)
+key_template_arxiv = key_template_metadata(<span class="s3">'arxiv'</span>, <span class="s3">'NeurIPS-2023'</span>)
+key_template_openreview = key_template_metadata(<span class="s3">'openreview'</span>, <span class="s3">'NeurIPS-2023'</span>)
+
+<span class="s0">#%% md 
+</span>## 获取官方元数据 
+<span class="s0">#%% 
+</span>os.environ[<span class="s3">'http_proxy'</span>] = <span class="s3">&quot;http://127.0.0.1:7890&quot;</span>
+os.environ[<span class="s3">'https_proxy'</span>] = <span class="s3">&quot;http://127.0.0.1:7890&quot;</span>
+
+<span class="s0"># 流程是根据title获取abstract的相对路径，然后拼成完整路径用fetch_spawn_concurrent并发调用</span>
+
+abs_urls, titles_ = zip(*re.findall(<span class="s3">r'&lt;a title=&quot;paper title&quot; href=&quot;([^&quot;]*)&quot;&gt;(.+?)&lt;/a&gt;'</span>, 
+                                    requests.get(<span class="s3">'https://papers.nips.cc/paper_files/paper/2023'</span>).text))
+
+abs_urls = list(map(<span class="s2">lambda </span>x:x.replace(<span class="s3">'_files/paper'</span>, <span class="s3">''</span>), abs_urls))
+<span class="s0"># title到abs相对路径的映射</span>
+title2abs = dict(zip(titles_, abs_urls))
+
+NeurIPS_ABS_API_URL = <span class="s3">'https://papers.nips.cc/paper_files'</span>
+
+<span class="s0"># async def invoker_neurips_abs(client, data, **kargs):</span>
+<span class="s0">#     return client.stream('GET', url=NeurIPS_ABS_API_URL+title2abs[data])</span>
+
+<span class="s0">#只需要定义调用请求的invoker和存在redis的key模板函数，就可以用并发函数执行了</span>
+
+<span class="s2">async def </span>invoker_neurips_abs(session, data, **kargs):
+    <span class="s2">return </span>session.get(url=NeurIPS_ABS_API_URL+title2abs[data],
+                       proxy=<span class="s3">&quot;http://127.0.0.1:7890&quot;</span>)
+
+invoker_neurips_abs.url = NeurIPS_ABS_API_URL
+fetcher_neurips_abs = build_fetcher(invoker_neurips_abs)
+
+<span class="s2">await </span>fetch_spawn_concurrent(fetcher_neurips_abs, key_template_neurips_abs, workers=<span class="s4">10</span>)(titles_)
+
+<span class="s0"># 单个用例的情况：</span>
+<span class="s0"># semaphore = asyncio.Semaphore(1)</span>
+<span class="s0"># async with aiohttp.ClientSession() as session:</span>
+<span class="s0">#     z = await fetcher_neurips_abs(titles[0], semaphore, session)</span>
+
+<span class="s0">#%% 
+# 随机删掉十条记录然后测试上面的并发调用</span>
+[redis_client.delete(x) <span class="s2">for </span>x <span class="s2">in </span>random.sample(redis_client.keys(<span class="s3">'neurips*'</span>), <span class="s4">10</span>)]
+!rma -s localhost -p <span class="s4">6379 </span>-d <span class="s4">15</span>
+<span class="s0">#%% md 
+</span>## arxiv、openreview元数据 
+<span class="s0">#%% 
+# 原理和官方元数据的调用基本相同。请求的参数会有区别</span>
+
+ARXIV_API_URL = <span class="s3">&quot;http://export.arxiv.org/api/query&quot;</span>
+OPENREVIEW_API_URL = <span class="s3">&quot;https://api2.openreview.net/notes/search&quot;</span>
+
+
+<span class="s2">async def </span>invoker_arxiv(session, data, **kargs):
+    <span class="s2">return </span>session.get(url=ARXIV_API_URL, 
+                       proxy=<span class="s3">&quot;http://127.0.0.1:7890&quot;</span>, 
+                       params={<span class="s3">'search_query'</span>:<span class="s3">f'ti:</span><span class="s2">{</span>data<span class="s2">}</span><span class="s3">'</span>, <span class="s3">'start'</span>:<span class="s4">0</span>, <span class="s3">'max_results'</span>:<span class="s4">1</span>})
+invoker_arxiv.url = ARXIV_API_URL
+
+
+<span class="s2">async def </span>invoker_openreview(session, data, **kargs):
+    <span class="s2">return </span>session.get(url=invoker_openreview.url, 
+                       proxy=<span class="s3">&quot;http://127.0.0.1:7890&quot;</span>, 
+                       params={<span class="s3">&quot;term&quot;</span>: data, <span class="s3">&quot;offset&quot;</span>: <span class="s4">0</span>, <span class="s3">&quot;limit&quot;</span>: <span class="s4">1</span>})
+invoker_openreview.url = OPENREVIEW_API_URL
+
+fetcher_arxiv = build_fetcher(invoker_arxiv)
+fetcher_openreview = build_fetcher(invoker_openreview)
+
+<span class="s2">await </span>fetch_spawn_concurrent(fetcher_arxiv, key_template_arxiv, workers=<span class="s4">10</span>)(titles)
+<span class="s0"># await fetch_spawn_concurrent(fetcher_openreview, key_template_openreview, workers=1)(titles)</span>
+<span class="s0">#%% 
+#同样是随机删掉十条记录用于测试</span>
+[redis_client.delete(x) <span class="s2">for </span>x <span class="s2">in </span>random.sample(redis_client.keys(<span class="s3">'arxiv*'</span>), <span class="s4">10</span>)]
+<span class="s0"># [redis_client.delete(x) for x in redis_client.keys('research_topic*')]</span>
+!rma -s localhost -p <span class="s4">6379 </span>-d <span class="s4">15</span>
+<span class="s0">#%% md 
+</span>## 数据清洗、处理 
+<span class="s0">#%% 
+</span><span class="s2">from </span>returns.context <span class="s2">import </span>Reader
+<span class="s2">from </span>returns.unsafe <span class="s2">import </span>unsafe_perform_io
+<span class="s2">from </span>returns.maybe <span class="s2">import </span>Maybe, Nothing
+
+<span class="s0"># 定义了一个Maybe的monad chain用于元数据后处理。输入：title，输出：采集的内容。</span>
+<span class="s0"># Maybe chain用于处理每一步可能出现的空值异常。暂时直接过滤了没有填充缺失值</span>
+
+metadata_chain = <span class="s2">lambda </span>key_template: <span class="s2">lambda </span>x: (((Maybe.from_optional(x)
+                                         .bind_optional(key_template))
+                                         .bind_optional(<span class="s2">lambda </span>x:redis_client.get(x)))
+                                         <span class="s0"># .or_else_call(...)</span>
+                                         <span class="s0"># .alt(...)</span>
+                                         .bind_optional(<span class="s2">lambda </span>x:x.decode(<span class="s3">'utf-8'</span>))
+                                         .bind_optional(<span class="s2">lambda </span>x:json.loads(x).get(<span class="s3">'response'</span>)))
+
+post_process = <span class="s2">lambda </span>metadata: {x[<span class="s4">0</span>]:x[<span class="s4">1</span>].unwrap() <span class="s2">for </span>x <span class="s2">in </span>filter(<span class="s2">lambda </span>x:x[<span class="s4">1</span>]!=Nothing, metadata)}
+
+<span class="s2">def </span>mapper():
+    ...
+<span class="s0">#%% 
+</span><span class="s2">import </span>xmltodict
+<span class="s2">from </span>difflib <span class="s2">import </span>SequenceMatcher
+<span class="s2">from </span>returns.pipeline <span class="s2">import </span>flow
+
+<span class="s0"># arxiv_chain = lambda x:((metadata_chain(x, key_template_arxiv)</span>
+<span class="s0">#                         .bind_optional(xmltodict.parse))</span>
+<span class="s0">#                         .bind_optional(lambda x:x.get('feed'))</span>
+<span class="s0">#                         .bind_optional(lambda x:x.get('entry'))</span>
+<span class="s0">#                         # .or_else_call({'entry': x}))</span>
+<span class="s0">#                         .bind_optional(lambda x:{'entry':x, 'arxiv_title':x.get('title')}))</span>
+<span class="s0"># </span>
+<span class="s0"># </span>
+<span class="s0"># metadata_arxiv = list(map(lambda x: (x, arxiv_chain(x)), titles))</span>
+
+<span class="s0">#用于解析arxiv请求结果的chain。输入：采集的响应数据，输出：元数据json。</span>
+
+arxiv_chain = <span class="s2">lambda </span>x:((Maybe.from_optional(x)
+                        .bind_optional(xmltodict.parse))
+                        .bind_optional(<span class="s2">lambda </span>x:x.get(<span class="s3">'feed'</span>))
+                        .bind_optional(<span class="s2">lambda </span>x:x.get(<span class="s3">'entry'</span>))
+                        <span class="s0"># .or_else_call({'entry': x}))</span>
+                        .bind_optional(<span class="s2">lambda </span>x:{<span class="s3">'entry'</span>:x, <span class="s3">'arxiv_title'</span>:x.get(<span class="s3">'title'</span>)}))
+
+<span class="s0">#将metadata_chain和arxiv_chain拼起来得到title→元数据的chain</span>
+
+metadata_arxiv = list(map(<span class="s2">lambda </span>x: (x, flow(x, 
+                                             metadata_chain(key_template_arxiv), 
+                                             <span class="s2">lambda </span>x:x.unwrap(), 
+                                             arxiv_chain)), titles))
+
+metadata_arxiv = post_process(metadata_arxiv)
+
+<span class="s0"># 过滤query和检索结果的title不一致的情况</span>
+metadta_arxiv_filter = <span class="s2">lambda </span>x:SequenceMatcher(<span class="s2">None</span>, x[<span class="s4">0</span>], x[<span class="s4">1</span>].get(<span class="s3">'arxiv_title'</span>)).ratio() &gt; <span class="s4">0.9</span>
+metadata_arxiv = dict(filter(metadta_arxiv_filter, metadata_arxiv.items()))
+
+<span class="s0">#%% 
+# 官方元数据解析的chain。title→元数据</span>
+metadata_neurips_abs = list(map(<span class="s2">lambda </span>x:
+                                (x,metadata_chain(key_template_neurips_abs)(x)
+                                 .bind_optional(<span class="s2">lambda </span>x: re.findall(<span class="s3">r'&lt;h4&gt;Abstract&lt;/h4&gt;\s*&lt;p&gt;(?:&lt;p&gt;)?([\s\S]*?)&lt;\/p&gt;'</span>,x))
+                                 ),
+                                titles))
+
+metadata_neurips_abs = post_process(metadata_neurips_abs)
+<span class="s0">#%% 
+</span><span class="s2">import </span>anyio
+<span class="s2">import </span>asyncio
+<span class="s2">from </span>functools <span class="s2">import </span>partial
+
+<span class="s0"># 这里说明了独立定义这些chain的好处。可以进行各种业务逻辑的形式化组合。</span>
+<span class="s0"># 比如说用future(一种monad)在arxiv检索结果和query不一致的时候用其他方式获取数据</span>
+
+<span class="s2">async def </span>fetch_chain(title):
+    semaphore = asyncio.Semaphore(<span class="s4">10</span>)
+    <span class="s2">async with </span>aiohttp.ClientSession() <span class="s2">as </span>session:
+        
+        fetcher_arxiv_ = partial(fetcher_arxiv, semaphore=semaphore, session=session)
+        result = <span class="s2">await </span>(Future.from_value(title)
+                        .bind_awaitable(fetcher_arxiv_)
+                        .map(<span class="s2">lambda </span>x:x.get(<span class="s3">'response'</span>))
+                        .map(arxiv_chain)
+                        .map(...)
+                        .awaitable())
+        <span class="s2">return </span>result
+
+z = <span class="s2">await </span>asyncio.get_event_loop().run_in_executor(<span class="s2">None</span>, anyio.run, fetch_chain)
+z1 = unsafe_perform_io(z).unwrap()
+
+<span class="s0">#%% md 
+</span># 基于Claude的问答数据集合成 
++ 用Claude总结所有的研究主题。输入：标题列表，输出：一组主题名称 
++ 为每个研究主题构造一些问题 
++ 用Retriever获取问题的相关论文 
++ 用Claude评估问题和论文的相关性 
++ 相关性用于训练RAG模型 
+# RAG pipeline 
++ 基于Bi-encoder的初排（语义相似度） 
++ 基于Cross-encoder的重排（阅读理解） 
+<span class="s0">#%% md 
+</span>## 总结NeurIPS 2023的主题 
+<span class="s0">#%% 
+# titles_id = list(enumerate(metadata_neurips_abs.keys()))</span>
+<span class="s0"># id2title = dict(titles_id)</span>
+<span class="s0"># ids = id2title.keys()</span>
+<span class="s0"># titles = list(id2title.values())</span>
+<span class="s0"># abs_text = list(map(lambda x:metadata_neurips_abs[x][0], titles))</span>
+
+<span class="s0">#%% md 
+</span># 基于标题列表生成主题名称 
+<span class="s0">#%% 
+</span><span class="s2">import </span>base64
+
+<span class="s0"># 把完整标题列表分块调用Claude生成主题，最后再合并结果</span>
+
+chunk_sz = <span class="s4">400</span>
+
+prompt_topic_gen = <span class="s3">&quot;&quot;&quot; 
+Task: Analyze and categorize paper titles from NeurIPS 2023 
+ 
+Dataset: 3500 paper titles, to be processed in batches of {{chunk_sz}} 
+ 
+For each batch, perform the following: 
+ 
+1. Identify coarse-grained research topics. The research topics should not be defined too broadly (such as machine learning), but need to have a certain degree of distinction (e.g., In-context learning, Graph Contrastive Learning, etc.) 
+2. Associate each paper with the identified areas and topics 
+ 
+Input format: List of paper titles with corresponding IDs 
+ 
+Output format: JSON structure as follows: 
+ 
+  &quot;research_topics&quot;: { 
+    &quot;topic1&quot;: [&quot;paper_id1&quot;, &quot;paper_id2&quot;, ...], 
+    &quot;topic2&quot;: [...], 
+    ... 
+  } 
+} 
+ 
+Batch 1 of paper titles: 
+ 
+{{titles}} 
+ 
+Provide the analysis for this batch. Subsequent batches will build upon the areas and topics identified in previous iterations. 
+&quot;&quot;&quot;</span>.replace(<span class="s3">'{{chunk_sz}}'</span>, str(chunk_sz))
+
+key_list = list(enumerate(metadata_neurips_abs.keys()))
+
+<span class="s0"># 为每个块生成输入的context</span>
+contexts_topic = list(map(<span class="s2">lambda </span>x: ((Maybe.from_optional(x)
+                               .bind_optional(<span class="s2">lambda </span>x:json.dumps(key_list[x*chunk_sz:(x+<span class="s4">1</span>)*chunk_sz])))
+                              .bind_optional(<span class="s2">lambda </span>x: prompt_topic_gen.replace(<span class="s3">'{{titles}}'</span>, x))
+                              .unwrap()),
+                   range(len(metadata_neurips_abs)//chunk_sz+<span class="s4">1</span>)))
+
+<span class="s0"># claude api的并发调用</span>
+
+token = os.environ[<span class="s3">'CLAUDE_API_token'</span>]
+model = <span class="s3">&quot;claude-3-5-sonnet-20240620&quot;</span>
+
+<span class="s0"># CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages'</span>
+CLAUDE_API_URL = <span class="s3">'https://api.gptapi.us/v1/chat/completions' </span><span class="s0"># 某个更稳定的国内CLAUDE中转</span>
+
+
+<span class="s2">async def </span>invoker_claude(session, data, **kargs):
+    <span class="s2">return </span>session.post(url=CLAUDE_API_URL,
+                        headers={<span class="s3">'Content-Type'</span>: <span class="s3">'application/json'</span>,
+                                 <span class="s3">'Authorization'</span>: <span class="s3">f'Bearer </span><span class="s2">{</span>token<span class="s2">}</span><span class="s3">'</span>},
+                        json={<span class="s3">&quot;model&quot;</span>: model,
+                                 <span class="s3">&quot;max_tokens&quot;</span>: <span class="s4">4096</span>,
+                                 <span class="s3">&quot;messages&quot;</span>: [{<span class="s3">&quot;role&quot;</span>: <span class="s3">&quot;user&quot;</span>, <span class="s3">&quot;content&quot;</span>: data}]})
+
+invoker_claude.url = CLAUDE_API_URL
+fetcher_claude = build_fetcher(invoker_claude)
+redis_client.delete(<span class="s3">&quot;research_topic:claude&quot;</span>)
+
+<span class="s0"># 对于每个输入context用base64编码作为redis的key</span>
+key_template_topic = <span class="s2">lambda </span>prompt: <span class="s3">f&quot;research_topic:claude:</span><span class="s2">{</span>base64.b64encode(prompt.encode()).decode()<span class="s2">}</span><span class="s3">&quot;</span>
+
+<span class="s0"># await fetch_spawn_concurrent(fetcher_claude, key_template_topic, workers=10)(contexts_topic)</span>
+<span class="s0">#%% 
+</span>[redis_client.delete(x) <span class="s2">for </span>x <span class="s2">in </span>redis_client.keys(<span class="s3">'research_topic*'</span>)]
+<span class="s0"># [redis_client.delete(x) for x in redis_client.keys('question*')]</span>
+!rma -s localhost -p <span class="s4">6379 </span>-d <span class="s4">15</span>
+<span class="s0">#%% 
+# Claude结果后处理</span>
+claude_chain = <span class="s2">lambda </span>x, key_template: (Maybe.from_optional(x)
+                                        .bind_optional(key_template)
+                                        .bind_optional(<span class="s2">lambda </span>x:redis_client.get(x))
+                                        .bind_optional(<span class="s2">lambda </span>x:x.decode(<span class="s3">'utf-8'</span>))
+                                        .bind_optional(<span class="s2">lambda </span>x:json.loads(x)[<span class="s3">'response'</span>])
+                                        .bind_optional(json.loads)
+                                        .bind_optional(<span class="s2">lambda </span>x:x[<span class="s3">'choices'</span>][<span class="s4">0</span>][<span class="s3">'message'</span>][<span class="s3">'content'</span>])
+                                        )
+<span class="s0">#%% md 
+</span># 主题合并 
+<span class="s0">#%% 
+</span><span class="s2">from </span>itertools <span class="s2">import </span>chain, groupby
+
+topic2papers = list(map(<span class="s2">lambda </span>x:
+                       claude_chain(x, key_template_topic)
+                       .bind_optional(<span class="s2">lambda </span>x: re.findall(<span class="s3">r'{[^{]*?}'</span>, x))
+                       .bind_optional(<span class="s2">lambda </span>x:x[<span class="s4">0</span>])
+                       .bind_optional(<span class="s2">lambda </span>x: json.loads(x))
+                       .unwrap(),
+                       contexts_topic))
+
+topic2papers_flatten = list(chain(*chain(*map(<span class="s2">lambda </span>x:
+                                            [[(a,c) <span class="s2">for </span>c <span class="s2">in </span>b] <span class="s2">for </span>a,b <span class="s2">in </span>x.items()], topic2papers))) )
+
+topic2papers = {x:list([z[<span class="s4">1</span>] <span class="s2">for </span>z <span class="s2">in </span>y]) <span class="s2">for </span>x,y <span class="s2">in </span>groupby(
+    sorted(topic2papers_flatten, key=<span class="s2">lambda </span>x:x[<span class="s4">0</span>]), key=<span class="s2">lambda </span>x:x[<span class="s4">0</span>]
+)}
+<span class="s0"># topic2title = {x:[id2title[int(z)] for z in y] for x,y in topic2id.items()}</span>
+<span class="s0">#%% md 
+</span>## 为每个主题生成问题 
+<span class="s0">#%% 
+</span>prompt_question_gen = <span class="s3">&quot;&quot;&quot; 
+You are now taking on the role of an AI researcher. 
+There is a LLM-based question-answering agent specifically designed for NeurIPS 2023. It can answer questions about the academic content of NeurIPS 2023 based on RAG technology. 
+ 
+Now, consider the following research topics and their corresponding paper titles: 
+{{topics}} 
+ 
+Your task is: 
+From the perspective of researchers in each of the above topics, conceive 5-7 questions related to NeurIPS 2023 based on these research topics. These questions should help you understand the trends in the mentioned research areas at this conference or be helpful for your research. The questions need to be clear, specific, practically meaningful, and in-depth. Please ensure the questions are diverse, including but not limited to: 
+- Analysis of research trends 
+- Discussion of technical details 
+- Comparison with previous years 
+- Cross-domain applications 
+- Current challenges 
+- Future research directions 
+ 
+Return the results in the following JSON format: 
+{ 
+  &quot;Topic1&quot;: [ 
+    &quot;Question1&quot;, 
+    &quot;Question2&quot;, 
+    ... 
+  ], 
+  &quot;Topic2&quot;: [ 
+    &quot;Question1&quot;, 
+    &quot;Question2&quot;, 
+    ... 
+  ], 
+  ... 
+} 
+ 
+Examples of questions: 
+1. &quot;Which GNN-related topics received significant attention at this conference?&quot; 
+2. &quot;Were there any new developments in GNN-based multi-hop reasoning presented at this conference?&quot; 
+3. &quot;Compared to last year's NeurIPS, in which application areas has GNN shown notable expansion?&quot; 
+4. &quot;What new discoveries were presented at this conference regarding the combination of GNNs and large language models?&quot; 
+5. &quot;What are the main challenges GNNs still face when dealing with dynamic graph structures?&quot; 
+&quot;&quot;&quot;</span>
+
+chunk_sz_question = <span class="s4">10</span>
+
+key_list2 = list(enumerate(topic2papers.keys()))
+
+prompts_question = list(map(<span class="s2">lambda </span>x: (Maybe.from_optional(x)
+                                       .bind_optional(<span class="s2">lambda </span>x:json.dumps(key_list2[x*chunk_sz_question:(x+<span class="s4">1</span>)*chunk_sz_question]))
+                                       .bind_optional(<span class="s2">lambda </span>x: prompt_question_gen.replace(<span class="s3">'{{topics}}'</span>, x))
+                                       .unwrap()),
+                   range(len(key_list2)//chunk_sz_question+<span class="s4">1</span>)))
+
+key_template_question = <span class="s2">lambda </span>prompt: <span class="s3">f&quot;question:claude:</span><span class="s2">{</span>base64.b64encode(prompt.encode()).decode()<span class="s2">}</span><span class="s3">&quot;</span>
+
+<span class="s2">await </span>fetch_spawn_concurrent(fetcher_claude, key_template_question, workers=<span class="s4">10</span>)(prompts_question)
+<span class="s0">#%% 
+</span>topic2question = list(map(<span class="s2">lambda </span>x:
+                       claude_chain(x, key_template_question)
+                       .bind_optional(<span class="s2">lambda </span>x: re.findall(<span class="s3">r'{[^{]*?}'</span>, x))
+                       .bind_optional(<span class="s2">lambda </span>x: x[<span class="s4">0</span>])
+                       .bind_optional(<span class="s2">lambda </span>x: json.loads(x))
+                       .unwrap(),
+                       prompts_question))
+
+questions = list(chain(*chain(*[list(x.values()) <span class="s2">for </span>x <span class="s2">in </span>topic2question])))
+<span class="s0">#%% md 
+</span># 论文摘要的embedding 
+<span class="s0">#%% 
+</span><span class="s2">from </span>sentence_transformers <span class="s2">import </span>SentenceTransformer
+<span class="s2">from </span>tqdm <span class="s2">import </span>tqdm <span class="s2">as </span>sync_tqdm
+<span class="s2">import </span>numpy <span class="s2">as </span>np
+<span class="s2">import </span>torch, faiss
+
+biencoder = SentenceTransformer(<span class="s3">'msmarco-distilbert-base-v4'</span>)
+crossencoder = SentenceTransformer(<span class="s3">'cross-encoder/ms-marco-MiniLM-L-6-v2'</span>)
+
+<span class="s2">with </span>torch.no_grad():
+    embeddings = np.array([biencoder.encode(x) <span class="s2">for </span>x <span class="s2">in </span>sync_tqdm(metadata_neurips_abs.keys())])
+
+<span class="s0">#%% md 
+</span>## 得到和question相关的候选paper 
+<span class="s0">#%% 
+</span><span class="s2">def </span>build_searcher(embeddings):
+    index = faiss.IndexFlatL2(len(embeddings[<span class="s4">0</span>]))
+    index.add(embeddings)
+    <span class="s2">def </span>search(query_text, top_k):
+        query_embedding = biencoder.encode(query_text)
+        query_embedding = query_embedding / np.linalg.norm(query_embedding)
+        distances, indices = index.search(query_embedding.reshape(<span class="s4">1</span>, -<span class="s4">1</span>), top_k)
+        search.simlarities = <span class="s4">1 </span>- (np.square(distances[<span class="s4">0</span>]) / <span class="s4">2</span>)
+        <span class="s2">return </span>indices[<span class="s4">0</span>]
+    <span class="s2">return </span>search
+
+searcher = build_searcher(embeddings)
+rs = searcher(questions[<span class="s4">0</span>], <span class="s4">10</span>)
+
+<span class="s0">#%% 
+</span><span class="s2">from </span>collections <span class="s2">import </span>Counter
+rs = [(q,searcher(q, <span class="s4">10</span>)) <span class="s2">for </span>q <span class="s2">in </span>sync_tqdm(questions)]
+retrieve_freq = Counter(list(chain(*rs)))
+retrieve_freq = {titles[x]:y <span class="s2">for </span>x,y <span class="s2">in </span>retrieve_freq.items()}
+<span class="s0"># retrieve_freq</span>
+<span class="s0">#%% 
+# TODO 相关性标签合成：用Claude评估question和初排结果的相关性；biencoder和crossencoder的微调</span>
+
+prompt_relv_gen = <span class="s3">&quot;&quot;&quot; 
+ 
+&quot;&quot;&quot;</span>
+<span class="s0">#%% 
+</span><span class="s2">from </span>sentence_transformers.training_args <span class="s2">import </span>SentenceTransformerTrainingArguments
+<span class="s2">from </span>sentence_transformers.trainer <span class="s2">import </span>SentenceTransformerTrainer
+
+<span class="s2">from </span>torch.utils.data <span class="s2">import </span>Dataset, DataLoader, random_split
+
+</pre>
+</body>
+</html>
